@@ -1,1 +1,1 @@
-# croft-seq-analysis
+# Croft-seq analysis scripts
