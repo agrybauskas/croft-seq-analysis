@@ -25,12 +25,12 @@ Finding potential cleavage sites (single-read):
     --bg-include \
     --cleavage-ratio 0.95 \
     --reading-frame 4 \
-    --bam sample.bam \
+    --bam sample-1.bam \
     --depth-change 20.0 \
     --include chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX,chrY \
     --reference reference.fasta \
     --seq GGAATCCCTTCTGCAGCACC \
-    > results.bed
+    > sample-1.bed
 ```
 
 Finding potential cleavage sites (pair-end):
@@ -54,23 +54,23 @@ Combining replication cleavage data (with AND operator):
 ./scripts/combine-cleavage-patterns.jl \
     --bed sample-1.bed,sample-2.bed,sample-3.bed \
     --operator AND \
-    > results-sample-combined.bed
+    > sample-combined.bed
 ```
 
 Combining replication cleavage data (with OR operator):
 
 ```bash
 ./scripts/combine-cleavage-patterns.jl \
-    --bed results-control-1.bed,results-control-2.bed,results-control-3.bed \
+    --bed control-1.bed,control-2.bed,control-3.bed \
     --operator OR \
-    > results-control-combined.bed
+    > control-combined.bed
 ```
 
 Excluding one cleavage data from another (with NOT operator):
 
 ```bash
 ./scripts/combine-cleavage-patterns.jl \
-    --bed results-sample-combined.bed,results-control-combined.bed \
+    --bed sample-combined.bed,control-combined.bed \
     --operator NOT \
     > results-sample-excluded-control.bed
 ```
@@ -81,13 +81,13 @@ Visualising cleavage sites (PAM sequence can be added by using `--next-seq NGG` 
 ./scripts/visualize-cleavage-patterns.jl \
     --no-alt-sequence \
     --show-gaps \
-    --bed results-sample-excluded-control.bed \
+    --bed sample-combined-excluded-control-combined.bed \
     --top 1000 \
     --include chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX,chrY \
     --reference reference.fasta \
     --seq GGAATCCCTTCTGCAGCACC \
     --output-format HTML \
-    > results-sample-excluded-control.html
+    > sample-combined-excluded-control-combined.html
 ```
 
 For the information of all available options for the scripts use `-h` or `--help` options.
