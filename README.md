@@ -75,7 +75,7 @@ Excluding one cleavage data from another (with NOT operator):
     > sample-combined-excluded-control-combined.bed
 ```
 
-Visualising cleavage sites (PAM sequence can be added by using `--next-seq NGG` option):
+Visualising cleavage sites (PAM sequence can be added by using `--show-next-seq NGG` option):
 
 ```
 ./scripts/visualize-cleavage-patterns.jl \
