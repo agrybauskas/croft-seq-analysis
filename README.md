@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-* Julia (v1.3.1) packages:
+* Julia (v1.8.2) packages:
   * ArgParse
   * BioAlignments
   * BioSequences
