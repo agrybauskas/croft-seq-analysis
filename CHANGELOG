@@ -1,3 +1,12 @@
+croft-seq-analysis (0.2.0)
+
+  * Fixed EMBOSS Needleman-Wunch algorithm's implementation for finding cleavage
+    positions by removing the gap penalty at the ends of the target sequence.
+  * Added background operator when combining cleavage positions.
+  * Added cleavage ratio filter when combining cleavage positions.
+  * Added cleavage distance filter when combining cleavage positions.
+  * Added max edit distance filter when visualising cleavage positions.
+
 croft-seq-analysis (0.1.0)
 
   * Initial release.

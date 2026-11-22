@@ -29,6 +29,22 @@ arg_parser = ArgParseSettings()
     "--operator"
         default = "AND"
         help = "Operator used to combine BED files. OR, AND or NOT can be chosen."
+    "--bg-include"
+        action = :store_true
+        help = "Includes background into calculations. Removes those targets " *
+               "that exceed background error values."
+    "--cleavage-ratio"
+        arg_type = Float64
+        default = 0.95
+        help = "Ratio of reads that belong to cleaved reads. Works when " *
+               "--bg-include flag is on."
+    "--bg-operator"
+        default = "OR"
+        help = "Operator used to check background/cleavage coverage BED files. OR, AND be chosen."
+    "--cleavage-distance"
+        arg_type = Int
+        default = -1
+        help = "Distance from cleavage to the end of the target sequence. Depends on the cleaving protein."
 end
 
 parsed_args = parse_args(ARGS, arg_parser)
@@ -52,6 +68,11 @@ function read_bed(bed)
         gaps = split(depth_gaps_and_mms[3], "GAPS=")[2]
         mismatches = split(depth_gaps_and_mms[2], "MM=")[2]
         overall_gap_quantity = split(depth_gaps_and_mms[7], "OVERALL_GAP_QUANTITY=")[2]
+        cleavage_pos = split(depth_gaps_and_mms[8], "CLEAVAGE_POS=")[2]
+        cleavage_ratio = split(depth_gaps_and_mms[9], "CLEAVAGE_RATIO=")[2]
+        if cleavage_ratio == ""
+            cleavage_ratio = "-1"
+        end
 
         gap_pos = Dict()
         for pos in split(split(depth_gaps_and_mms[4], "GAP_POS=")[2], ",")
@@ -83,13 +104,15 @@ function read_bed(bed)
                    "ref_gap_pos" => ref_gap_pos,
                    "bar_len" => bar_len,
                    "bar_pos" => bar_pos,
-                   "overall_gap_quantity" => overall_gap_quantity))
+                   "overall_gap_quantity" => overall_gap_quantity,
+                   "cleavage_pos" => cleavage_pos,
+                   "cleavage_ratio" => cleavage_ratio))
     end
 
     return output_data
 end
 
-function join_bed(bed_datas, fmt; operator="and")
+function join_bed(bed_datas, fmt; operator="and", bg_include=false, bg_operator="or", cleavage_pos=-1, cleavage_ratio=-1, cleavage_distance=-1)
     # Key is generated that is composed of chromosome, strand, start and end
     # positions in order to quicly find visited cleavage sites.
     combined_visited_bed_data = Dict()
@@ -111,12 +134,16 @@ function join_bed(bed_datas, fmt; operator="and")
                 combined_visited_bed_data[key] = Dict("mean_coverage_sum" => combined_visited_bed_data[key]["mean_coverage_sum"] + bed_row["depth"],
                                                       "bed_counter" => combined_visited_bed_data[key]["bed_counter"] + 1,
                                                       "bed_row" => bed_row,
-                                                      "bed_first_idx" => combined_visited_bed_data[key]["bed_first_idx"])
+                                                      "bed_first_idx" => combined_visited_bed_data[key]["bed_first_idx"],
+                                                      "cleavage_pos" => push!(combined_visited_bed_data[key]["cleavage_pos"], parse(Int, bed_row["cleavage_pos"])),
+                                                      "cleavage_ratio" => push!(combined_visited_bed_data[key]["cleavage_ratio"], parse(Float64, bed_row["cleavage_ratio"])))
             else
                 combined_visited_bed_data[key] = Dict("mean_coverage_sum" => bed_row["depth"],
                                                       "bed_counter" => 1,
                                                       "bed_row" => bed_row,
-                                                      "bed_first_idx" => bed_counter)
+                                                      "bed_first_idx" => bed_counter,
+                                                      "cleavage_pos" => [ parse(Int, bed_row["cleavage_pos"]) ],
+                                                      "cleavage_ratio" => [ parse(Float64, bed_row["cleavage_ratio"]) ] )
             end
         end
 
@@ -141,6 +168,19 @@ function join_bed(bed_datas, fmt; operator="and")
             continue
         end
 
+        if bg_include
+            if bg_operator == "and"
+                if all(map((x) -> x < cleavage_ratio, combined_visited_bed_data[bed_key]["cleavage_ratio"]))
+                    continue
+                end
+            end
+            if bg_operator == "or"
+                if any(map((x) -> x < cleavage_ratio, combined_visited_bed_data[bed_key]["cleavage_ratio"]))
+                    continue
+                end
+            end
+        end
+
         bed_row = combined_visited_bed_data[bed_key]["bed_row"]
         mean_coverage_sum = combined_visited_bed_data[bed_key]["mean_coverage_sum"]
         chr = bed_row["chrom"]
@@ -155,8 +195,14 @@ function join_bed(bed_datas, fmt; operator="and")
         bar_pos = bed_row["bar_pos"]
         bar_len = bed_row["bar_len"]
         mean_coverage = mean_coverage_sum / bed_counter
+        mean_cleavage_ratio = sum(combined_visited_bed_data[bed_key]["cleavage_ratio"]) / bed_counter
+        mean_cleavage_pos = round(Int, sum(combined_visited_bed_data[bed_key]["cleavage_pos"]) / bed_counter)
 
-        push!(output_data, (mean_coverage, format(fmt, chr, string(start_pos), string(end_pos), "region_" * string(region_counter), "COV=" * string(mean_coverage) * ";MM=" * string(mismatch_quantity) * ";GAPS=" * string(gap_quantity) * ";GAP_POS=" * join(sort(collect(keys(gap_pos))), ",") * ";REF_GAP_POS=" * join(sort(collect(keys(ref_gap_pos))), ",") * ";REF_GAP_LEN=" * join(map(x->ref_gap_pos[x], sort(collect(keys(ref_gap_pos)))), ",") * ";OVERALL_GAP_QUANTITY=" * string(overall_gap_quantity), strand, string(start_pos), string(end_pos), "120,120,120", string(length(bar_pos)), join(bar_len, ","), join(bar_pos, ","))))
+        if cleavage_distance > 0 && ! (strand == "+" && end_pos - mean_cleavage_pos - 1 == cleavage_distance || strand == "-" && mean_cleavage_pos - start_pos == cleavage_distance)
+            continue
+        end
+
+        push!(output_data, (mean_coverage, format(fmt, chr, string(start_pos), string(end_pos), "region_" * string(region_counter), "COV=" * string(mean_coverage) * ";MM=" * string(mismatch_quantity) * ";GAPS=" * string(gap_quantity) * ";GAP_POS=" * join(sort(collect(keys(gap_pos))), ",") * ";REF_GAP_POS=" * join(sort(collect(keys(ref_gap_pos))), ",") * ";REF_GAP_LEN=" * join(map(x->ref_gap_pos[x], sort(collect(keys(ref_gap_pos)))), ",") * ";OVERALL_GAP_QUANTITY=" * string(overall_gap_quantity) * ";CLEAVAGE_POS=" * string(mean_cleavage_pos) * ";CLEAVAGE_RATIO=" * string(mean_cleavage_ratio), strand, string(start_pos), string(end_pos), "120,120,120", string(length(bar_pos)), join(bar_len, ","), join(bar_pos, ","))))
 
         region_counter += 1
     end
@@ -176,6 +222,10 @@ function main()
     chr_include_str = options["include"]
     chr_exclude_str = options["exclude"]
     operator = lowercase(options["operator"])
+    bg_include = options["bg-include"]
+    cleavage_ratio = options["cleavage-ratio"]
+    bg_operator = lowercase(options["bg-operator"])
+    cleavage_distance = options["cleavage-distance"]
 
     chr_include = Dict()
     chr_exclude = Dict()
@@ -198,7 +248,7 @@ function main()
         push!(bed_datas, read_bed(bed))
     end
 
-    output_data = join_bed(bed_datas, fmt; operator=operator)
+    output_data = join_bed(bed_datas, fmt; operator=operator, bg_include=bg_include, bg_operator=bg_operator, cleavage_ratio=cleavage_ratio, cleavage_distance=cleavage_distance)
 
     sort!(output_data, by=x->x[1], rev=true) # Probably do not have to sort.
 

@@ -2,18 +2,21 @@
 
 ## Prerequisites
 
-* Julia (tested on v1.3.1);
-* Julia packages:
+* Julia (v1.3.1) packages:
   * ArgParse
   * BioAlignments
   * BioSequences
+  * Clustering
+  * CodecZlib
   * CSVFiles
   * DataFrames
+  * FASTX
   * Formatting
   * Gumbo
-  * Printf
   * PyCall
-  * Statistics
+  * XAM
+* Python (v3.10.12) library:
+  * Biopython
 
 ## Usage
 
@@ -91,3 +94,11 @@ Visualising cleavage sites (PAM sequence can be added by using `--show-next-seq 
 ```
 
 For the information of all available options for the scripts use `-h` or `--help` options.
+
+## Citing
+
+If you use *Croft-seq* in your research, please cite:
+* Paulius Toliusis, Algirdas Grybauskas, Tomas Sinkunas, Tautvydas Karvelis,
+Giedrius Sasnauskas, Mindaugas Zaremba, Off-target detection of CRISPR-Cas9
+nuclease in vitro with CROFT-Seq, Synthetic Biology, Volume 11, Issue 1, 2026,
+ysag006. https://doi.org/10.1093/synbio/ysag006

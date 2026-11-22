@@ -5,15 +5,17 @@ using BioAlignments
 using BioSequences
 using CSVFiles
 using DataFrames
+using FASTX
 using Formatting
 using Gumbo
 using Printf
 using Statistics
 using PyCall
+using XAM
 
 arg_parser = ArgParseSettings()
 
-@add_arg_table arg_parser begin
+@add_arg_table! arg_parser begin
     "--bam"
         arg_type = String
         default = ""
@@ -80,6 +82,14 @@ arg_parser = ArgParseSettings()
         arg_type = String
         default = ""
         help = "Analyses only specified chromosome region. Used for debugging."
+    "--match-reward"
+        arg_type = Int64
+        help = "Alignment match award score."
+        default = 5
+    "--mismatch-penalty"
+        arg_type = Int64
+        help = "Alignment mismatch penalty score."
+        default = -4
     "--gap-open-penalty"
         arg_type = Int64
         help = "Alignment gap-open penalty score."
@@ -113,6 +123,7 @@ Base.@kwdef mutable struct CleavageCandidate
     target_seq_aln::String = ""
     cleavage_seq_aln::String = ""
     cleavage_seq_start::Int64 = -1
+    cleavage_ratio::Float64 = -1
 end
 
 #
@@ -127,7 +138,7 @@ function read_bam(bam::String;
                   region::Dict{String,Union{String,Int64}}=Dict(),
                   bg_include::Bool=false)::Tuple{Dict{String,Array{Complex{Int64},1}},Dict{String,Dict{Int64,Bool}},Dict{String,Array{Int64,1}}, Int64, Int64}
     # Reading bam.
-    bam_reader::BioAlignments.BAM.Reader{IOStream} = open(BAM.Reader, bam)
+    bam_reader::XAM.BAM.Reader{IOStream} = open(XAM.BAM.Reader, bam)
 
     read_start_quantity::Dict{String,Array{Complex{Int64},1}} = Dict()
     bg_coverage::Dict{String,Array{Int64,1}} = Dict()
@@ -136,12 +147,12 @@ function read_bam(bam::String;
     total_ref_length::Int64 = 0
     total_read_start_quantity::Int64 = 0
 
-    bam_record::BioAlignments.BAM.Record = BAM.Record()
+    bam_record::XAM.BAM.Record = XAM.BAM.Record()
     while !eof(bam_reader)
         read!(bam_reader, bam_record)
 
-        if BAM.ismapped(bam_record)
-            refname::String = BAM.refname(bam_record)
+        if XAM.BAM.ismapped(bam_record)
+            refname::String = XAM.BAM.refname(bam_record)
 
             # Flag explantion:
             # 1. read paired
@@ -156,7 +167,7 @@ function read_bam(bam::String;
             # 10. read fails platform/vendor quality checks
             # 11. read is PCR or optical duplicate
             # 12. supplementary alignment
-            flags::Array{Int64,1} = digits(BAM.flag(bam_record), base=2, pad=12)
+            flags::Array{Int64,1} = digits(XAM.BAM.flags(bam_record), base=2, pad=12)
 
             # Removes R1 or R2 accordingly.
             if ignore_r1_reads && flags[7] == 1
@@ -174,13 +185,13 @@ function read_bam(bam::String;
                     continue
                 end
 
-                if BAM.position(bam_record) < region["start"] || BAM.position(bam_record) > region["end"]
+                if XAM.BAM.position(bam_record) < region["start"] || XAM.BAM.position(bam_record) > region["end"]
                     continue
                 end
             end
 
             if ! haskey(read_start_quantity, refname)
-                ref_length[refname] = BAM.reflen(bam_record)
+                ref_length[refname] = XAM.BAM.reflen(bam_record)
                 read_start_quantity[refname] = zeros(ref_length[refname])
                 total_ref_length += ref_length[refname]
             end
@@ -193,9 +204,9 @@ function read_bam(bam::String;
 
             # Determines how to modify coverage from record position, direction
             # and length.
-            left_pos::Int64 = BAM.position(bam_record)
-            right_pos::Int64 = BAM.rightposition(bam_record)
-            mapq::UInt8 = BAM.mappingquality(bam_record)
+            left_pos::Int64 = XAM.BAM.position(bam_record)
+            right_pos::Int64 = XAM.BAM.rightposition(bam_record)
+            mapq::UInt8 = XAM.BAM.mappingquality(bam_record)
 
             # Filtering out white reads.
             if (mapq == 0 && exclude_white_reads) || (mapq > 0 && mapq < mapq_min)
@@ -250,11 +261,11 @@ end
 function find_cleavage_regions(read_start_pos::Dict{String,Dict{Int64,Bool}},
                                read_start_quantity::Dict{String,Array{Complex{Int64},1}};
                                reading_frame::Int64=2,
-                               depth_change::Float64=4.0)::Dict{String,Array{Tuple{Int64,Int64},1}}
+                               depth_change::Float64=4.0)::Dict{String,Array{Tuple{Int64,Int64,Int64},1}}
     # Copy has to be done here, because delete!() acts on already allocated
     # dictiory values and there is no delete().
     read_start_pos_cp::Dict{String,Dict{Int64,Bool}} = deepcopy(read_start_pos)
-    cleavage_regions::Dict{String,Array{Tuple{Int64,Int64},1}} = Dict()
+    cleavage_regions::Dict{String,Array{Tuple{Int64,Int64,Int64},1}} = Dict()
     for refname::String in sort(collect(keys(read_start_pos_cp)))
         ref_len::Int64 = length(read_start_quantity[refname])
 
@@ -301,7 +312,7 @@ function find_cleavage_regions(read_start_pos::Dict{String,Dict{Int64,Bool}},
                 cleavage_regions[refname] = []
             end
 
-            push!(cleavage_regions[refname], (final_left_pos, final_right_pos))
+            push!(cleavage_regions[refname], (final_left_pos, final_right_pos, pos))
 
             # Remove every position that is in between.
             for i in [final_left_pos:right_boundary-1;]
@@ -363,28 +374,31 @@ end
 
 function align_seq(seq1::String,
                    seq2::String,
-                   scoremodel::AffineGapScoreModel{Int64};
+                   scoremodel::AffineGapScoreModel{Int64},
+                   emboss_scoremodel;
                    log_file::String="",
                    do_emboss::Bool=false)::Tuple{String,String,Int64}
     # TODO: add types when it will be used in the future.
     if do_emboss
         # Use get(o, i-1)
         emboss_alignment = emboss_scoremodel.align(string(seq1), string(seq2))
-        emboss_seq, _, emboss_ref_seq, _ = split(string(emboss_alignment[1].__str__()), "\n")
-        emboss_score = floor(Int, emboss_alignment[1].score)
+        # HACK: not sure if the longer than 60 bp sequences would work here.
+        emboss_seq = filter(!isempty, split(string(get(emboss_alignment, 0).__str__()), [ '\n', ' ']))[3]
+        emboss_ref_seq = filter(!isempty, split(string(get(emboss_alignment, 0).__str__()), [ '\n', ' ']))[10]
+        emboss_score = floor(Int, emboss_alignment.score)
         # NOTE: debugging.
         if log_file != ""
             open(log_file, "a+") do f
-                println(f, emboss_alignment[1].__str__())
+                println(f, get(emboss_alignment, 0).__str__())
             end
         end
         return String(emboss_seq), String(emboss_ref_seq), emboss_score
     else
         # TODO: types should be simplified.
-        pair_alignment::PairwiseAlignmentResult{Int64,BioSequence{DNAAlphabet{4}},BioSequence{DNAAlphabet{4}}} =
-            pairalign(GlobalAlignment(), DNASequence(seq1),
-                      DNASequence(seq2), scoremodel, banded=true)
-        aln::PairwiseAlignment{BioSequence{DNAAlphabet{4}},BioSequence{DNAAlphabet{4}}} =
+        pair_alignment::PairwiseAlignmentResult{Int64,BioSequences.LongSequence{DNAAlphabet{4}},BioSequences.LongSequence{DNAAlphabet{4}}} =
+            pairalign(GlobalAlignment(), BioSequences.LongDNA{4}(seq1),
+                      BioSequences.LongDNA{4}(seq2), scoremodel, banded=true)
+        aln::PairwiseAlignment{BioSequences.LongSequence{DNAAlphabet{4}},BioSequences.LongSequence{DNAAlphabet{4}}} =
             alignment(pair_alignment)
         alignment_score::Int64 = score(pair_alignment)
 
@@ -395,7 +409,7 @@ function align_seq(seq1::String,
         end
 
         # NOTE: should the type be declared to x and y?
-        return String(DNASequence([x for (x, _) in aln])), String(DNASequence([y for (_, y) in aln])), alignment_score
+        return String(BioSequences.LongDNA{4}([x for (x, _) in aln])), String(BioSequences.LongDNA{4}([y for (_, y) in aln])), alignment_score
     end
 end
 
@@ -469,6 +483,7 @@ function update_if_better!(original_cleavage_candidate::CleavageCandidate,
     original_cleavage_candidate.target_seq_aln = cleavage_candidate.target_seq_aln
     original_cleavage_candidate.cleavage_seq_aln = cleavage_candidate.cleavage_seq_aln
     original_cleavage_candidate.cleavage_seq_start = cleavage_candidate.cleavage_seq_start
+    original_cleavage_candidate.cleavage_ratio = cleavage_candidate.cleavage_ratio
 
     return nothing
 end
@@ -478,27 +493,28 @@ end
 # sequence.
 #
 
-function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,Array{Tuple{Int64,Int64},1}},
+function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,Array{Tuple{Int64,Int64,Int64},1}},
                                         read_start_quantity::Dict{String,Array{Complex{Int64},1}},
                                         refname::String,
                                         reading_frame::Int64,
                                         reference_seq::String,
                                         target_seq::String,
-                                        scoremodel::AffineGapScoreModel{Int64};
+                                        scoremodel::AffineGapScoreModel{Int64},
+                                        emboss_scoremodel;
                                         bg_coverage::Dict{String,Array{Int64,1}}=Dict(),
                                         cleavage_ratio::Float64=0.95,
                                         left_bp::Int64=length(target_seq),
                                         right_bp::Int64=length(target_seq),
                                         log_file::String="",
-                                        do_emboss::Bool=false)::Dict{Int64,Dict{String,Union{Int64,String}}}
+                                        do_emboss::Bool=false)::Dict{Int64,Dict{String,Union{Int64,String,Float64}}}
     ref_len::Int64 = length(reference_seq)
     bg_include::Bool = length(bg_coverage) > 0 ? true : false
 
     target_seq_rc::String =
-        string(reverse_complement(DNASequence(target_seq)))
+        string(reverse_complement(BioSequences.LongDNA{4}(target_seq)))
 
-    best_cleavage_positions::Dict{Int64,Dict{String,Union{Int64,String}}} = Dict()
-    for cleavage_regions::Tuple{Int64,Int64} in reference_cleavage_regions[refname]
+    best_cleavage_positions::Dict{Int64,Dict{String,Union{Int64,String,Float64}}} = Dict()
+    for cleavage_regions::Tuple{Int64,Int64,Int64} in reference_cleavage_regions[refname]
         best_cleavage_candidate::CleavageCandidate = CleavageCandidate()
 
         for region_pos::Int64 in [cleavage_regions[1]:cleavage_regions[2];]
@@ -513,12 +529,6 @@ function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,
                                       bg_coverage[refname],
                                       region_pos,
                                       reading_frame)
-
-                if current_cleavage_ratio > 1.0
-                    println("chrom: ", refname)
-                    println("pos: ", region_pos)
-                end
-
                 if log_file != ""
                     open(log_file, "a+") do f
                         println(f, "Background coverage")
@@ -541,16 +551,17 @@ function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,
             # Forward sequence alignment.
             if region_pos - left_bp + 1 > 0 && region_pos + right_bp - 1 <= ref_len
                 cleavage_seq::String =
-                    string(reverse_complement(DNASequence(reference_seq[region_pos-left_bp+1:region_pos+right_bp-1])))
+                    string(reverse_complement(BioSequences.LongDNA{4}(reference_seq[region_pos-left_bp+1:region_pos+right_bp-1])))
                 target_seq_aln::String, cleavage_seq_aln::String, aln_score::Int64 =
-                    align_seq(target_seq_rc, cleavage_seq, scoremodel;
-                              log_file=log_file, do_emboss=do_emboss)
+                    align_seq(target_seq_rc, cleavage_seq, scoremodel,
+                              emboss_scoremodel; log_file=log_file,
+                              do_emboss=do_emboss)
 
                 # Reverse complementing after alignment.
                 target_seq_aln =
-                    string(reverse_complement(DNASequence(target_seq_aln)))
+                    string(reverse_complement(BioSequences.LongDNA{4}(target_seq_aln)))
                 cleavage_seq_aln =
-                    string(reverse_complement(DNASequence(cleavage_seq_aln)))
+                    string(reverse_complement(BioSequences.LongDNA{4}(cleavage_seq_aln)))
 
                 cleavage_candidate::CleavageCandidate =
                     CleavageCandidate(strand="+",
@@ -561,7 +572,8 @@ function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,
                                       score=aln_score,
                                       target_seq_aln=target_seq_aln,
                                       cleavage_seq_aln=cleavage_seq_aln,
-                                      cleavage_seq_start=region_pos-left_bp+1)
+                                      cleavage_seq_start=region_pos-left_bp+1,
+                                      cleavage_ratio=current_cleavage_ratio)
 
                 update_if_better!(best_cleavage_candidate, cleavage_candidate;
                                   log_file=log_file)
@@ -573,8 +585,9 @@ function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,
                     reference_seq[region_pos-right_bp+1:region_pos+left_bp-1]
 
                 target_seq_aln_rc::String, cleavage_seq_aln_rc::String,  aln_score_rc::Int64 =
-                    align_seq(target_seq_rc, cleavage_seq_rc, scoremodel;
-                              log_file=log_file, do_emboss=do_emboss)
+                    align_seq(target_seq_rc, cleavage_seq_rc, scoremodel,
+                              emboss_scoremodel; log_file=log_file,
+                              do_emboss=do_emboss)
 
                 cleavage_candidate_rc::CleavageCandidate =
                     CleavageCandidate(strand="-",
@@ -585,7 +598,8 @@ function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,
                                       score=aln_score_rc,
                                       target_seq_aln=target_seq_aln_rc,
                                       cleavage_seq_aln=cleavage_seq_aln_rc,
-                                      cleavage_seq_start=region_pos-right_bp+1)
+                                      cleavage_seq_start=region_pos-right_bp+1,
+                                      cleavage_ratio=current_cleavage_ratio)
 
                 update_if_better!(best_cleavage_candidate, cleavage_candidate_rc;
                                   log_file=log_file)
@@ -604,7 +618,8 @@ function choose_best_cleavage_positions(reference_cleavage_regions::Dict{String,
             Dict("strand" => best_cleavage_candidate.strand,
                  "cleavage_seq_aln" => best_cleavage_candidate.cleavage_seq_aln,
                  "target_seq_aln" => best_cleavage_candidate.target_seq_aln,
-                 "cleavage_seq_start" => best_cleavage_candidate.cleavage_seq_start)
+                 "cleavage_seq_start" => best_cleavage_candidate.cleavage_seq_start,
+                 "cleavage_ratio" => best_cleavage_candidate.cleavage_ratio)
 
         if log_file != ""
             open(log_file, "a+") do f
@@ -722,7 +737,7 @@ function parse_alignment(seq::String,
     seq_bars::Array{Dict{String,Int64},1} =
         [Dict("bar_pos" => match.offset,
               "bar_len" => length(match.match))
-         for match::RegexMatch in eachmatch(r"[ACGT]+", seq_no_gaps)]
+         for match::RegexMatch in eachmatch(r"[ACGTSWRYKMBVHDN]+", seq_no_gaps)]
 
     bar_pos::Array{Int64,1} = []
     bar_len::Array{Int64,1} = []
@@ -796,16 +811,6 @@ function main()::Nothing
         options[key] = val
     end
 
-    if options["emboss"]
-        emboss_align = pyimport("Bio.Align")
-        emboss_scoremodel = emboss_align.PairwiseAligner()
-        emboss_scoremodel.mode = "global"
-        emboss_scoremodel.open_gap_score = -10.0
-        emboss_scoremodel.extend_gap_score = -0.5
-        emboss_scoremodel.target_end_gap_score = -10.0
-        emboss_scoremodel.target_extend_gap_score = -0.5
-    end
-
     bam::String = options["bam"]
     reference_file::String = options["reference"]
     reading_frame::Int64 = options["reading-frame"]
@@ -820,6 +825,8 @@ function main()::Nothing
     chr_include_str::String = options["include"]
     chr_exclude_str::String = options["exclude"]
     region_str::String = options["region"]
+    match_reward::Int64 = options["match-reward"]
+    mismatch_penalty::Int64 = options["mismatch-penalty"]
     gap_open_penalty::Int64 = options["gap-open-penalty"]
     gap_extend_penalty::Int64 = options["gap-extend-penalty"]
     mapq_min::Int64 = options["mapq-min"]
@@ -881,15 +888,32 @@ function main()::Nothing
             read_bam(bam, ignore_r1_reads=ignore_r1, ignore_r2_reads=ignore_r2,
                      mapq_min=mapq_min, region=region, bg_include=bg_include)
 
-        reference::BioSequences.FASTA.Reader =
-            FASTA.Reader(Base.open(reference_file, "r"),
-                         index=index="$reference_file.fai")
+        # Score models.
+
+        # Needleman-Wunch.
         scoremodel::AffineGapScoreModel{Int64} =
-            AffineGapScoreModel(EDNAFULL, match=5, mismatch=-4,
+            AffineGapScoreModel(EDNAFULL,
+                                match=match_reward,
+                                mismatch=mismatch_penalty,
                                 gap_open=gap_open_penalty,
                                 gap_extend=gap_extend_penalty)
 
-        cleavage_regions::Dict{String,Array{Tuple{Int64,Int64},1}} =
+        # EMBOSS Needleman-Wunch.
+        emboss_align = pyimport("Bio.Align")
+        emboss_align.substitution_matrices.load("NUC.4.4")
+        emboss_scoremodel = emboss_align.PairwiseAligner()
+        emboss_scoremodel.mode = "global"
+        emboss_scoremodel.match = match_reward
+        emboss_scoremodel.mismatch = mismatch_penalty
+        emboss_scoremodel.open_gap_score = gap_open_penalty # EMBOSS defaults: -10.0
+        emboss_scoremodel.extend_gap_score = gap_extend_penalty # EMBOSS defaults: -0.5
+        emboss_scoremodel.end_insertion_score = 0
+
+        reference::FASTX.FASTA.Reader =
+            FASTX.FASTA.Reader(Base.open(reference_file, "r"),
+                         index=index="$reference_file.fai")
+
+        cleavage_regions::Dict{String,Array{Tuple{Int64,Int64,Int64},1}} =
             find_cleavage_regions(read_start_pos, read_start_quantity,
                                   reading_frame=reading_frame,
                                   depth_change=depth_change)
@@ -907,7 +931,7 @@ function main()::Nothing
         # Cleavage regions data parsing.
         region_counter::Int64 = 1
         for refname::String in sort(collect(keys(cleavage_regions)))
-            reference_seq::String = string(sequence(reference[refname]))
+            reference_seq::String = string(FASTX.sequence(reference[refname]))
             ref_len::Int64 = length(reference_seq)
 
             # Including/excluding chromosomes.
@@ -922,7 +946,7 @@ function main()::Nothing
             # the potential target sequences that are analogous to target with
             # the best alignment score within the cleavage region.
             # TODO: refactor function, because it has too many arguments.
-            cleavage_positions::Dict{Int64,Dict{String,Union{Int64,String}}} =
+            cleavage_positions::Dict{Int64,Dict{String,Union{Int64,String,Float64}}} =
                 choose_best_cleavage_positions(cleavage_regions,
                                                read_start_quantity,
                                                refname,
@@ -930,11 +954,13 @@ function main()::Nothing
                                                reference_seq,
                                                target_seq,
                                                scoremodel,
+                                               emboss_scoremodel,
                                                bg_coverage=bg_coverage,
                                                cleavage_ratio=cleavage_ratio,
                                                left_bp=left_bp,
                                                right_bp=right_bp,
-                                               log_file=log_file)
+                                               log_file=log_file,
+                                               do_emboss=do_emboss_alignment)
 
             # Extracts additional information on the alignment that will be used
             # later.
@@ -964,6 +990,8 @@ function main()::Nothing
                     real(sum(read_start_quantity[refname][pos:pos+reading_frame-1])) +
                     imag(sum(read_start_quantity[refname][pos:pos+reading_frame-1]))
                 strand::String = cleavage_positions[pos]["strand"]
+                current_cleavage_ratio::Float64 =
+                    cleavage_positions[pos]["cleavage_ratio"]
 
                 if ! only_cleavage_pos
                     push!(output_data, (
@@ -979,7 +1007,9 @@ function main()::Nothing
                                ";GAP_POS=" * join(sort(collect(keys(gap_pos))), ",") *
                                ";REF_GAP_POS=" * join(sort(collect(keys(ref_gap_pos))), ",") *
                                ";REF_GAP_LEN=" * join(map(x->ref_gap_pos[x], sort(collect(keys(ref_gap_pos)))), ",") *
-                               ";OVERALL_GAP_QUANTITY=" * string(overall_gap_quantity),
+                               ";OVERALL_GAP_QUANTITY=" * string(overall_gap_quantity) *
+                               ";CLEAVAGE_POS=" * string(pos) *
+                               ";CLEAVAGE_RATIO=" * string(round(current_cleavage_ratio; digits=6)),
                                strand,
                                string(start_pos),
                                string(end_pos),
@@ -1002,7 +1032,9 @@ function main()::Nothing
                                ";GAP_POS=" * join(sort(collect(keys(gap_pos))), ",") *
                                ";REF_GAP_POS=" * join(sort(collect(keys(ref_gap_pos))), ",") *
                                ";REF_GAP_LEN=" * join(map(x->ref_gap_pos[x], sort(collect(keys(ref_gap_pos)))), ",") *
-                               ";OVERALL_GAP_QUANTITY=" * string(overall_gap_quantity),
+                               ";OVERALL_GAP_QUANTITY=" * string(overall_gap_quantity) *
+                               ";CLEAVAGE_POS=" * string(pos) *
+                               ";CLEAVAGE_RATIO=" * string(round(current_cleavage_ratio; digits=6)),
                                strand,
                                string(start_pos),
                                string(end_pos),

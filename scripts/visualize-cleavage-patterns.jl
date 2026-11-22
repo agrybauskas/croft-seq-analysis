@@ -4,6 +4,7 @@ using ArgParse
 using BioAlignments
 using BioSequences
 using CSVFiles, DataFrames
+using FASTX
 using Formatting
 using Gumbo
 using Printf
@@ -35,6 +36,10 @@ arg_parser = ArgParseSettings()
         arg_type = Int64
         help = "Regions with highest depth"
         default = 1000000
+    "--max-edit-distance"
+        arg_type = Int64
+        help = "Maximum allowed mismatch/indel for the target sequence in the alignment."
+        default = -1
     "--no-alt-sequence"
         help = "Searches for alternative target positions and counts them."
         action = :store_true
@@ -51,7 +56,7 @@ end
 
 parsed_args = parse_args(ARGS, arg_parser)
 
-function read_bed(bed::String)::Array{Dict{String,Any},1}
+function read_bed(bed::String; max_mismatch::Int64=-1)::Array{Dict{String,Any},1}
     output_data::Array{Dict{String,Any},1} = []
     bed_data::DataFrame =
         DataFrame(load(File{format"CSV"}(bed), delim='\t', header_exists=false))
@@ -60,14 +65,21 @@ function read_bed(bed::String)::Array{Dict{String,Any},1}
         chrom_start::Int64 = bed_row["Column2"]
         chrom_end::Int64 = bed_row["Column3"]
         strand::String = bed_row["Column6"]
-        depth_gaps_and_mms::Array{String,1} = split(bed_row["Column5"], ";")
-        depth::Float64 = parse(Float64, split(depth_gaps_and_mms[1], "COV=")[2])
-        gaps::String = split(depth_gaps_and_mms[3], "GAPS=")[2]
-        mismatches::String = split(depth_gaps_and_mms[2], "MM=")[2]
-        overall_gap_quantity::String = split(depth_gaps_and_mms[7], "OVERALL_GAP_QUANTITY=")[2]
+        depth::Float64 = parse(Float64, match(r"COV=([0-9\.]*)", bed_row["Column5"]).captures[1])
+        gaps::String = match(r"GAPS=([0-9]*)", bed_row["Column5"]).captures[1]
+        mismatches::String = match(r"MM=([0-9]*)", bed_row["Column5"]).captures[1]
+        overall_gap_quantity::String = match(r"OVERALL_GAP_QUANTITY=([0-9]*)", bed_row["Column5"]).captures[1]
+        cleavage_pos::String =
+            match(r"CLEAVAGE_POS=([0-9]*)", bed_row["Column5"]) != nothing ?
+            match(r"CLEAVAGE_POS=([0-9]*)", bed_row["Column5"]).captures[1] : ""
+
+        if max_mismatch >= 0 &&
+            parse(Int, mismatches) > max_mismatch
+            continue
+        end
 
         gap_pos::Dict{Int64,Bool} = Dict()
-        for pos::String in split(split(depth_gaps_and_mms[4], "GAP_POS=")[2], ",")
+        for pos::String in split(match(r"(?!REF_)GAP_POS=([0-9,]*)", bed_row["Column5"]).captures[1], ",")
             if pos != ""
                 gap_pos[parse(Int64, pos)] = true
             end
@@ -75,9 +87,9 @@ function read_bed(bed::String)::Array{Dict{String,Any},1}
 
         ref_gap_pos::Dict{Int64,Int64} = Dict()
         ref_gap_pos_list::Array{String,1} =
-            split(split(depth_gaps_and_mms[5], "REF_GAP_POS=")[2], ",")
+            split(match(r"REF_GAP_POS=([0-9,]*)", bed_row["Column5"]).captures[1], ",")
         ref_gap_len_list::Array{String,1} =
-            split(split(depth_gaps_and_mms[6], "REF_GAP_LEN=")[2], ",");
+            split(match(r"REF_GAP_LEN=([0-9,]*)", bed_row["Column5"]).captures[1], ",")
         for i::Int64 in [1:length(ref_gap_pos_list);]
             if ref_gap_pos_list[i] != ""
                 ref_gap_pos[parse(Int64, ref_gap_pos_list[i])] =
@@ -102,7 +114,8 @@ function read_bed(bed::String)::Array{Dict{String,Any},1}
                    "ref_gap_pos" => ref_gap_pos,
                    "bar_len" => bar_len,
                    "bar_pos" => bar_pos,
-                   "overall_gap_quantity" => overall_gap_quantity))
+                   "overall_gap_quantity" => overall_gap_quantity,
+                   "cleavage_pos" => cleavage_pos))
     end
 
     return sort!(output_data, by=x->x["depth"], rev=true)
@@ -162,6 +175,11 @@ function generate_seq_dots_html(seq::String,
 
     # Adding reference gaps.
     for i::Int64 in [1:length(ref_seq);]
+        # TODO: carefully check any anomalies.
+        if i > length(final_seq)
+            break
+        end
+
         if final_seq[i] == ref_seq[i] || final_seq[i] == 'N' || ref_seq[i] == 'N'
             if length(gap_pos) > 0 && haskey(gap_pos, i) && i != 1
                 seq_dots_html =
@@ -227,12 +245,13 @@ function main()
 
     reference_file::String = options["reference"]
 
-    target_seq::String = options["seq"]
+    target_seq::String = replace(options["seq"], r"X|\|" => "")
     do_show_gaps::Bool = options["show-gaps"]
     show_next_seq::String = options["show-next-seq"]
     next_seq_len::Int64 = length(show_next_seq)
     move_to_back::Bool = options["move-to-back"]
     top::Int64 = options["top"]
+    max_edit_distance::Int64 = options["max-edit-distance"]
     no_alt_sequence::Bool = options["no-alt-sequence"]
     chr_include_str::String = options["include"]
     chr_exclude_str::String = options["exclude"]
@@ -253,9 +272,9 @@ function main()
 
     if output_format == "html"
         if no_alt_sequence
-            fmt = FormatExpr("{:<6} {:<40} {} {:<18} {:<18} {:<18} {:<18} {:<18}\n")
-        else
             fmt = FormatExpr("{:<6} {:<40} {} {:<18} {:<18} {:<18} {:<18} {:<18} {:<18}\n")
+        else
+            fmt = FormatExpr("{:<6} {:<40} {} {:<18} {:<18} {:<18} {:<18} {:<18} {:<18} {:<18}\n")
         end
     elseif output_format == "bed"
         fmt = FormatExpr("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n")
@@ -264,16 +283,17 @@ function main()
     output_data = []
 
     if output_format == "html"
-        bed_data::Array{Dict{String,Any},1} = read_bed(bed)
-        reference::BioSequences.FASTA.Reader =
-            FASTA.Reader(Base.open(reference_file, "r"),
-                         index=index="$reference_file.fai")
+        bed_data::Array{Dict{String,Any},1} =
+            read_bed(bed; max_mismatch=max_edit_distance)
+        reference::FASTX.FASTA.Reader =
+            FASTX.FASTA.Reader(Base.open(reference_file, "r"),
+                               index=index="$reference_file.fai")
 
         ref_dic::Dict{String,String} = Dict()
         ref_len::Dict{String,Int64} = Dict()
         for ref in reference
-            ref_dic[seqname(ref)] = string(DNASequence(sequence(ref)))
-            ref_len[seqname(ref)] = length(ref_dic[seqname(ref)])
+            ref_dic[identifier(ref)] = string(BioSequences.LongDNA{4}(FASTX.sequence(ref)))
+            ref_len[identifier(ref)] = length(ref_dic[identifier(ref)])
         end
 
         rank::Int64 = 1
@@ -296,6 +316,7 @@ function main()
             bar_pos::Array{Int64,1} = bed_row["bar_pos"]
             bar_len::Array{Int64,1} = bed_row["bar_len"]
             overall_gap_quantity::String = bed_row["overall_gap_quantity"]
+            cleavage_pos::String = bed_row["cleavage_pos"]
 
             final_seq::String = ""
 
@@ -306,7 +327,7 @@ function main()
                 for ref_name::String in sort(collect(keys(ref_dic)))
                     alt_seq_count +=
                         length(collect(eachmatch(Regex(string(ref_dic[chrom_name][start_pos+1:end_pos]) * "|" *
-                        string(reverse_complement(DNASequence(ref_dic[chrom_name][start_pos+1:end_pos])))), ref_dic[ref_name]; overlap=true)))
+                        string(reverse_complement(BioSequences.LongDNA{4}(ref_dic[chrom_name][start_pos+1:end_pos])))), ref_dic[ref_name]; overlap=true)))
                 end
             end
 
@@ -321,7 +342,7 @@ function main()
             # For reverse strands gap positions changes with reference to
             # a visualization.
             if strand == "-"
-                final_seq = string(reverse_complement(DNASequence(final_seq)))
+                final_seq = string(reverse_complement(BioSequences.LongDNA{4}(final_seq)))
 
                 # Gap positions has to be reset and recalculated for "-" strand.
                 gap_pos_old::Dict{Int64,Bool} = gap_pos
@@ -362,7 +383,7 @@ function main()
                     final_seq_end = start_pos
 
                     final_seq_add =
-                        string(reverse_complement(DNASequence(ref_dic[chrom_name][final_seq_start:final_seq_end])))
+                        string(reverse_complement(BioSequences.LongDNA{4}(ref_dic[chrom_name][final_seq_start:final_seq_end])))
                 end
 
                 final_seq *= final_seq_add
@@ -370,6 +391,11 @@ function main()
             end
 
             if final_seq == ""
+                continue
+            end
+
+            if max_edit_distance > 0 &&
+               mismatch_quantity + parse(Int64, overall_gap_quantity) > max_edit_distance
                 continue
             end
 
@@ -392,7 +418,8 @@ function main()
                               string(round(depth; digits=3)),
                               string(gap_quantity),
                               overall_gap_quantity,
-                              string(mismatch_quantity)) *
+                              string(mismatch_quantity),
+                              cleavage_pos != "" ? chrom_name * ':' * cleavage_pos : "") *
                        "</span>"))
             else
                 push!(output_data,
@@ -405,6 +432,7 @@ function main()
                               string(gap_quantity),
                               overall_gap_quantity,
                               string(mismatch_quantity),
+                              cleavage_pos != "" ? chrom_name * ':' * cleavage_pos : "",
                               string(alt_seq_count)) *
                        "</span>"))
             end
@@ -417,16 +445,17 @@ function main()
         if no_alt_sequence
             output_html =
                 format(fmt, "Rank", "Position", ruller(target_seq * show_next_seq),
-                       "Strand", "Depth", "Gap count", "Gap length sum", "Mismatches") *
+                       "Strand", "Depth", "Gap count", "Gap length sum", "Mismatches",
+                       "Cleavage position") *
                 format(fmt, "", "Target-sequence", target_seq * show_next_seq,
-                       "", "", "", "", "")
+                       "", "", "", "", "", "")
         else
             output_html =
                 format(fmt, "Rank", "Position", ruller(target_seq * show_next_seq),
                        "Strand", "Depth", "Gap count", "Gap length sum",
-                       "Mismatches", "Alt. seq. count") *
+                       "Mismatches", "Cleavage position", "Alt. seq. count") *
                 format(fmt, "", "Target-sequence", target_seq * show_next_seq,
-                       "", "", "", "", "", "")
+                       "", "", "", "", "", "", "")
         end
 
         for output_row in output_data
