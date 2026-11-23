@@ -6,7 +6,6 @@
   * ArgParse
   * BioAlignments
   * BioSequences
-  * Clustering
   * CodecZlib
   * CSVFiles
   * DataFrames
